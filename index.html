@@ -59,6 +59,7 @@
   .hud button{width:42px;height:42px;border-radius:10px;background:rgba(22,32,58,.75);
     color:#cfe0ff;border:2px solid #2a3a60;font-size:18px;line-height:1;padding:0}
   .hud button:hover{border-color:#4fd1ff}
+  .hud button.off{opacity:.45}
 </style>
 </head>
 <body>
@@ -66,7 +67,8 @@
   <canvas id="pong" width="1200" height="800" aria-label="ピンポンゲーム画面"></canvas>
 
   <div class="hud" id="hud" hidden>
-    <button id="muteBtn" title="音のオン・オフ（M）" aria-label="音のオン・オフ">🔊</button>
+    <button id="bgmBtn" title="BGMのオン・オフ（B）" aria-label="BGMのオン・オフ">🎵</button>
+    <button id="muteBtn" title="効果音のオン・オフ（M）" aria-label="効果音のオン・オフ">🔊</button>
     <button id="pauseBtn" title="一時停止（Space）" aria-label="一時停止">⏸</button>
   </div>
 
@@ -98,6 +100,14 @@
         <div class="seg" data-key="points">
           <button data-val="5">5点</button>
           <button data-val="11">11点</button>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="label">サウンド</div>
+        <div class="seg">
+          <button id="sfxToggle">効果音 ON</button>
+          <button id="bgmToggle">BGM ON</button>
         </div>
       </div>
 
