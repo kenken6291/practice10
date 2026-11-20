@@ -1,6 +1,6 @@
 /*
  * Ping Pong — practice10
- * CPU対戦（3段階）／2人対戦、マウス・タッチ・キーボード操作、効果音＋BGM、戦績保存
+ * CPU対戦（3段階）／2人対戦／通信対戦（PeerJS）、マウス・タッチ・キーボード操作、効果音＋BGM、戦績保存
  */
 (() => {
   'use strict';
@@ -28,7 +28,7 @@
   const canvas = $('pong');
   const ctx = canvas.getContext('2d');
   const gameEl = $('game');
-  const overlays = { menu: $('menu'), pause: $('pauseMenu'), over: $('overMenu') };
+  const overlays = { menu: $('menu'), how: $('howMenu'), pause: $('pauseMenu'), over: $('overMenu') };
 
   // ===== 保存（localStorage が使えない環境でも動くように） =====
   const STORE_KEY = 'practice10-pong-v2';
@@ -181,6 +181,12 @@
       tone(midi(64), 0.8, { type: 'triangle', vol: 0.09, ui: true, when: 0.78, slide: midi(58) });
     },
   };
+
+  // 通信対戦のホストは、鳴らした効果音をゲストにも送る
+  const sfxRaw = { ...sfx };
+  ['paddle', 'wall', 'serve', 'count', 'go', 'rally', 'deuce'].forEach((k) => {
+    sfx[k] = (...a) => { sfxRaw[k](...a); if (isHost() && state !== 'menu') sendNet({ t: 'e', k: 'sfx', n: k, a }); };
+  });
 
   // ----- BGM（ステップシーケンサー） -----
   const TRACKS = {
@@ -388,7 +394,12 @@
     }
 
     scorer.score++;
-    (settings.mode === 'cpu' && side === 1 ? sfx.scoreBad : sfx.scoreGood)();
+    if (isOnline()) {
+      (side === 0 ? sfx.scoreGood : sfx.scoreBad)();
+      sendNet({ t: 'e', k: 'score', side });
+    } else {
+      (settings.mode === 'cpu' && side === 1 ? sfx.scoreBad : sfx.scoreGood)();
+    }
     popText = { text: '+1', color: scorer.color, x: side === 0 ? W / 4 : W * 3 / 4, t: 1 };
     resetBall();
 
@@ -413,6 +424,7 @@
 
   function startGame() {
     ensureAudio();
+    if (isOnline() && !isHost()) return;  // 通信対戦はホストだけが開始できる
     paddles.forEach((p) => { p.score = 0; p.y = H / 2; p.vy = 0; p.target = null; p.aiErr = 0; p.flash = 0; });
     bestRallyGame = 0;
     rally = 0;
@@ -422,6 +434,7 @@
     state = 'countdown';  // beep が鳴るよう先に menu を抜ける
     beginCountdown(3, true);
     syncBgm();
+    if (isHost()) sendNet({ t: 'start', points: settings.points });
     showOverlay(null);
     gameEl.classList.add('playing');
   }
@@ -438,7 +451,15 @@
     const newBest = bestRallyGame > bestRally;
     if (newBest) store.set('bestRally', bestRallyGame);
 
-    if (settings.mode === 'cpu') {
+    if (isOnline()) {
+      const rec = store.get('onlineRec', { w: 0, l: 0 });
+      if (winner === 0) rec.w++; else rec.l++;
+      store.set('onlineRec', rec);
+      title = winner === 0 ? 'あなたの勝ち！' : '相手の勝ち…';
+      lines.push(`通信対戦 通算 ${rec.w}勝 ${rec.l}敗`);
+      (winner === 0 ? sfx.win : sfx.lose)();
+      sendNet({ t: 'over', w: winner, sc: [l, r], br: bestRallyGame });
+    } else if (settings.mode === 'cpu') {
       const rec = store.get('rec', {});
       const r0 = rec[settings.diff] || { w: 0, l: 0 };
       if (winner === 0) r0.w++; else r0.l++;
@@ -453,15 +474,12 @@
     }
     lines.push(`この試合の最長ラリー：${bestRallyGame}` + (newBest ? ' <span class="new">★自己ベスト更新！</span>' : ''));
 
-    $('overTitle').textContent = title;
-    $('overTitle').style.color = winner === 0 ? COLORS.left : COLORS.right;
-    $('overScore').innerHTML = `<span class="l">${l}</span> - <span class="r">${r}</span>`;
-    $('overInfo').innerHTML = lines.join('<br>');
-    showOverlay('over');
+    showResult(title, winner === 0 ? COLORS.left : COLORS.right, l, r, lines);
     burst(winner === 0 ? W / 4 : W * 3 / 4, H / 2, paddles[winner].color, 80, 520);
   }
 
   function goMenu() {
+    if (net.peer) { netReset(); setNetStatus(''); }
     state = 'menu';
     gameEl.classList.remove('playing');
     paddles.forEach((p) => { p.score = 0; p.target = null; });
@@ -473,7 +491,7 @@
   }
 
   function pause() {
-    if (!inPlay()) return;
+    if (!inPlay() || isOnline()) return;  // 通信対戦中は一時停止しない
     pausedFrom = state;
     state = 'paused';
     syncBgm();
@@ -529,7 +547,11 @@
   }
 
   // ===== エフェクト =====
-  function burst(x, y, color, n, speed) {
+  function burst(...a) {
+    burstRaw(...a);
+    if (isHost() && state !== 'menu') sendNet({ t: 'e', k: 'b', a });
+  }
+  function burstRaw(x, y, color, n, speed) {
     for (let i = 0; i < n; i++) {
       const a = Math.random() * Math.PI * 2;
       const s = speed * (0.3 + Math.random() * 0.7);
@@ -579,7 +601,17 @@
 
     if (state === 'over') return;
 
-    if (settings.mode === 'cpu') {
+    if (isGuest()) {  // ゲスト：自分のパドルだけ動かし、ボールは受信データから補間
+      controlPaddle(paddles[1], dt, ['KeyW', 'ArrowUp'], ['KeyS', 'ArrowDown']);
+      sendNet({ t: 'i', y: paddles[1].y });
+      if (state === 'playing') { ball.x += ball.vx * dt; ball.y += ball.vy * dt; }
+      updateTrail();
+      return;
+    }
+
+    if (isOnline()) {
+      controlPaddle(paddles[0], dt, ['KeyW', 'ArrowUp'], ['KeyS', 'ArrowDown']);
+    } else if (settings.mode === 'cpu') {
       controlPaddle(paddles[0], dt, ['KeyW', 'ArrowUp'], ['KeyS', 'ArrowDown']);
       aiMove(paddles[1], dt, DIFF[settings.diff], 1);
     } else {
@@ -600,6 +632,7 @@
       stepBall(dt);
     }
     updateTrail();
+    if (isHost() && (state === 'countdown' || state === 'playing')) sendState();
   }
 
   // ===== 描画 =====
@@ -657,8 +690,8 @@
     drawDigits(String(l.score), W / 4, 36, 12, 'rgba(79,209,255,.85)');
     drawDigits(String(r.score), W * 3 / 4, 36, 12, 'rgba(255,95,162,.85)');
 
-    const names = settings.mode === 'cpu'
-      ? ['あなた', `CPU（${DIFF[settings.diff].label}）`]
+    const names = settings.mode === 'cpu' ? ['あなた', `CPU（${DIFF[settings.diff].label}）`]
+      : isOnline() ? (net.role === 'guest' ? ['相手', 'あなた'] : ['あなた', '相手'])
       : ['P1', 'P2'];
     text(names[0], W / 4, 118, 22, 'rgba(232,240,255,.55)');
     text(names[1], W * 3 / 4, 118, 22, 'rgba(232,240,255,.55)');
@@ -667,8 +700,10 @@
     const target = settings.points;
     if (l.score >= target - 1 && r.score >= target - 1) {
       let label = 'デュース', color = '#ffd166';
-      if (l.score > r.score) { label = settings.mode === 'cpu' ? 'アドバンテージ あなた' : 'アドバンテージ P1'; color = COLORS.left; }
-      if (r.score > l.score) { label = settings.mode === 'cpu' ? 'アドバンテージ CPU' : 'アドバンテージ P2'; color = COLORS.right; }
+      const nm = settings.mode === 'cpu' ? ['あなた', 'CPU']
+        : isOnline() ? (net.role === 'guest' ? ['相手', 'あなた'] : ['あなた', '相手']) : ['P1', 'P2'];
+      if (l.score > r.score) { label = 'アドバンテージ ' + nm[0]; color = COLORS.left; }
+      if (r.score > l.score) { label = 'アドバンテージ ' + nm[1]; color = COLORS.right; }
       ctx.fillStyle = 'rgba(7,10,18,.8)';
       ctx.fillRect(W / 2 - 170, 150, 340, 40);
       text(label, W / 2, 171, 24, color);
@@ -757,10 +792,226 @@
     requestAnimationFrame(frame);
   }
 
+  // ===== 通信対戦（PeerJS / WebRTC） =====
+  // ホスト（部屋を作った人）が左パドル＆試合計算を担当、ゲストは右パドルの位置を送るだけ
+  const PEER_PREFIX = 'kenken6291-pp10-';
+  const PEERJS_URL = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
+  const net = { role: null, peer: null, conn: null, connected: false, closing: false, code: '', sendTick: 0 };
+  const isOnline = () => settings.mode === 'online';
+  const isHost = () => isOnline() && net.role === 'host' && net.connected;
+  const isGuest = () => isOnline() && net.role === 'guest' && net.connected;
+
+  function setNetStatus(html) { $('netStatus').innerHTML = html; }
+
+  function sendNet(m) {
+    if (net.conn && net.connected) { try { net.conn.send(m); } catch (e) { /* noop */ } }
+  }
+
+  function loadPeer() {
+    return new Promise((resolve, reject) => {
+      if (window.Peer) { resolve(); return; }
+      const sc = document.createElement('script');
+      sc.src = PEERJS_URL;
+      sc.onload = () => resolve();
+      sc.onerror = () => reject(new Error('load'));
+      document.head.appendChild(sc);
+    });
+  }
+
+  function genCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let c = '';
+    for (let i = 0; i < 5; i++) c += chars[(Math.random() * chars.length) | 0];
+    return c;
+  }
+
+  function netReset() {
+    net.closing = true;
+    try { if (net.conn) net.conn.close(); } catch (e) { /* noop */ }
+    try { if (net.peer) net.peer.destroy(); } catch (e) { /* noop */ }
+    net.role = null; net.peer = null; net.conn = null; net.connected = false; net.code = '';
+    setTimeout(() => { net.closing = false; }, 300);
+  }
+
+  async function hostRoom() {
+    netReset();
+    setNetStatus('部屋を準備しています…');
+    try { await loadPeer(); } catch (e) { setNetStatus('通信用プログラムを読み込めませんでした。ネット接続を確認してください。'); return; }
+    net.closing = false;
+    const code = genCode();
+    net.role = 'host';
+    net.code = code;
+    const peer = net.peer = new window.Peer(PEER_PREFIX + code, { debug: 0 });
+    peer.on('open', () => {
+      setNetStatus(`部屋コード <span class="code">${code}</span><br>このコードを相手に伝えて、入室を待っています…`);
+    });
+    peer.on('connection', (conn) => {
+      if (net.conn) {  // 満員
+        conn.on('open', () => { conn.send({ t: 'full' }); setTimeout(() => conn.close(), 300); });
+        return;
+      }
+      setupConn(conn);
+    });
+    peer.on('error', (err) => {
+      if (err.type === 'unavailable-id') { hostRoom(); return; }  // コード重複 → 作り直し
+      setNetStatus('通信エラー（' + err.type + '）。もう一度「部屋を作る」を押してください。');
+    });
+  }
+
+  async function joinRoom() {
+    const code = $('roomInput').value.trim().toUpperCase();
+    if (!/^[A-Z0-9]{5}$/.test(code)) { setNetStatus('部屋コードを5文字で入力してください。'); return; }
+    netReset();
+    setNetStatus('接続しています…');
+    try { await loadPeer(); } catch (e) { setNetStatus('通信用プログラムを読み込めませんでした。ネット接続を確認してください。'); return; }
+    net.closing = false;
+    net.role = 'guest';
+    const peer = net.peer = new window.Peer({ debug: 0 });
+    peer.on('open', () => {
+      const conn = peer.connect(PEER_PREFIX + code, { reliable: true, serialization: 'json' });
+      setupConn(conn);
+      setTimeout(() => { if (net.role === 'guest' && !net.connected) setNetStatus('つながりません。コードを確認して、もう一度お試しください。'); }, 10000);
+    });
+    peer.on('error', (err) => {
+      setNetStatus(err.type === 'peer-unavailable'
+        ? 'その部屋が見つかりません。コードを確認してください。'
+        : '通信エラー（' + err.type + '）。もう一度お試しください。');
+    });
+  }
+
+  function setupConn(conn) {
+    net.conn = conn;
+    conn.on('open', () => {
+      net.connected = true;
+      if (net.role === 'host') {
+        setNetStatus('相手が入室しました！まもなく開始します…');
+        setTimeout(() => { if (state === 'menu' && net.connected) startGame(); }, 900);
+      } else {
+        setNetStatus('接続しました！ホストの開始を待っています…');
+      }
+    });
+    conn.on('data', onNet);
+    conn.on('close', onDisconnect);
+    conn.on('error', onDisconnect);
+  }
+
+  function onDisconnect() {
+    if (net.closing) return;
+    const was = net.connected;
+    netReset();
+    if (isOnline()) {
+      goMenu();
+      setNetStatus(was ? '相手との接続が切れました。' : '接続できませんでした。');
+    }
+  }
+
+  function onNet(m) {
+    if (!m || typeof m !== 'object') return;
+    if (net.role === 'host') {
+      if (m.t === 'i') {
+        const p = paddles[1];
+        const y = clamp(Number(m.y) || H / 2, p.h / 2, H - p.h / 2);
+        p.vy = (y - p.y) * 30;
+        p.y = y;
+      } else if (m.t === 'again' && state === 'over') {
+        startGame();
+      }
+      return;
+    }
+    // ----- ゲスト側 -----
+    switch (m.t) {
+      case 'start': guestStart(m); break;
+      case 's': applyState(m); break;
+      case 'e':
+        if (m.k === 'sfx' && sfxRaw[m.n]) sfxRaw[m.n](...(m.a || []));
+        else if (m.k === 'b') burstRaw(...m.a);
+        else if (m.k === 'score') { (m.side === 1 ? sfx.scoreGood : sfx.scoreBad)(); shake = 14; }
+        break;
+      case 'over': guestOver(m); break;
+      case 'full': setNetStatus('その部屋はすでに満員です。'); netReset(); break;
+      default: break;
+    }
+  }
+
+  function sendState() {
+    net.sendTick ^= 1;
+    if (net.sendTick) return;  // 約30回/秒
+    sendNet({
+      t: 's', st: state, cd: countdown, n: showCountNumbers, r: rally,
+      b: [ball.x, ball.y, ball.vx, ball.vy], bc: ball.color,
+      p0: paddles[0].y, f: [paddles[0].flash, paddles[1].flash],
+      sc: [paddles[0].score, paddles[1].score],
+      pt: popText,
+    });
+  }
+
+  function guestStart(m) {
+    settings.points = m.points;
+    paddles.forEach((p) => { p.score = 0; p.y = H / 2; p.vy = 0; p.target = null; p.flash = 0; });
+    particles = [];
+    popText = null;
+    bestRallyGame = 0;
+    resetBall();
+    state = 'countdown';
+    showCountNumbers = true;
+    countdown = 3;
+    syncBgm();
+    showOverlay(null);
+    gameEl.classList.add('playing');
+  }
+
+  function applyState(m) {
+    if (state === 'menu' || state === 'over') return;
+    const [x, y, vx, vy] = m.b;
+    if (Math.abs(x - ball.x) > 200 || Math.abs(y - ball.y) > 200) trail = [];
+    ball.x = x; ball.y = y; ball.vx = vx; ball.vy = vy; ball.color = m.bc;
+    paddles[0].y = m.p0;
+    paddles[0].flash = Math.max(paddles[0].flash, m.f[0]);
+    paddles[1].flash = Math.max(paddles[1].flash, m.f[1]);
+    paddles[0].score = m.sc[0];
+    paddles[1].score = m.sc[1];
+    rally = m.r;
+    bestRallyGame = Math.max(bestRallyGame, rally);
+    countdown = m.cd;
+    showCountNumbers = m.n;
+    if (m.pt) popText = m.pt;
+    if (m.st !== state && (m.st === 'countdown' || m.st === 'playing')) { state = m.st; syncBgm(); }
+  }
+
+  function guestOver(m) {
+    state = 'over';
+    syncBgm();
+    gameEl.classList.remove('playing');
+    paddles[0].score = m.sc[0];
+    paddles[1].score = m.sc[1];
+    const win = m.w === 1;
+    const rec = store.get('onlineRec', { w: 0, l: 0 });
+    if (win) rec.w++; else rec.l++;
+    store.set('onlineRec', rec);
+    const best = store.get('bestRally', 0);
+    const newBest = m.br > best;
+    if (newBest) store.set('bestRally', m.br);
+    (win ? sfx.win : sfx.lose)();
+    showResult(win ? 'あなたの勝ち！' : '相手の勝ち…', COLORS[m.w === 0 ? 'left' : 'right'], m.sc[0], m.sc[1], [
+      `通信対戦 通算 ${rec.w}勝 ${rec.l}敗`,
+      `この試合の最長ラリー：${m.br}` + (newBest ? ' <span class="new">★自己ベスト更新！</span>' : ''),
+    ]);
+    burstRaw(m.w === 0 ? W / 4 : W * 3 / 4, H / 2, paddles[m.w].color, 80, 520);
+  }
+
+  function showResult(title, color, l, r, lines) {
+    $('overTitle').textContent = title;
+    $('overTitle').style.color = color;
+    $('overScore').innerHTML = `<span class="l">${l}</span> - <span class="r">${r}</span>`;
+    $('overInfo').innerHTML = lines.join('<br>');
+    showOverlay('over');
+  }
+
   // ===== UI =====
   function showOverlay(name) {
     Object.entries(overlays).forEach(([k, el]) => { el.hidden = k !== name; });
     $('hud').hidden = !(name === null || name === 'pause') || state === 'menu' || state === 'over';
+    $('pauseBtn').hidden = isOnline();
   }
 
   function refreshMenu() {
@@ -771,12 +1022,18 @@
       });
     });
     $('diffGroup').hidden = settings.mode !== 'cpu';
+    $('onlineGroup').hidden = !isOnline();
+    $('startBtn').hidden = isOnline();
 
     const best = store.get('bestRally', 0);
     if (settings.mode === 'cpu') {
       const r = store.get('rec', {})[settings.diff] || { w: 0, l: 0 };
       $('record').textContent = `「${DIFF[settings.diff].label}」の戦績：${r.w}勝 ${r.l}敗 ／ 最長ラリー ${best}`;
       $('help').innerHTML = 'マウス・タッチで上下に動かす ／ キーボード：W・S または ↑・↓<br>Space：一時停止 ／ M：効果音 ／ B：BGM ／ Enter：スタート';
+    } else if (isOnline()) {
+      const r = store.get('onlineRec', { w: 0, l: 0 });
+      $('record').textContent = `通信対戦の戦績：${r.w}勝 ${r.l}敗 ／ 最長ラリー ${best}`;
+      $('help').innerHTML = '部屋を作った人が左（水色）、入った人が右（ピンク）<br>マウス・指の上下、または W・S／↑・↓ で操作 ／ M：効果音 ／ B：BGM';
     } else {
       $('record').textContent = `最長ラリー ${best}`;
       $('help').innerHTML = '左（P1）：W・S または 画面左半分をタッチ<br>右（P2）：↑・↓ または 画面右半分をタッチ<br>Space：一時停止 ／ M：効果音 ／ B：BGM';
@@ -817,12 +1074,26 @@
       settings[key] = v;
       store.set(key, v);
       ensureAudio();
+      if (key === 'mode' && v !== 'online' && net.peer) { netReset(); setNetStatus(''); }
       refreshMenu();
     });
   });
 
   $('startBtn').addEventListener('click', startGame);
-  $('againBtn').addEventListener('click', startGame);
+  $('howBtn').addEventListener('click', () => showOverlay('how'));
+  $('howCloseBtn').addEventListener('click', () => showOverlay('menu'));
+  $('againBtn').addEventListener('click', () => {
+    if (isGuest()) {
+      sendNet({ t: 'again' });
+      $('overInfo').innerHTML += '<br>相手に再戦を申し込みました…';
+    } else if (isOnline() && !isHost()) {
+      goMenu();
+    } else {
+      startGame();
+    }
+  });
+  $('hostBtn').addEventListener('click', hostRoom);
+  $('joinBtn').addEventListener('click', joinRoom);
   $('toMenuBtn').addEventListener('click', goMenu);
   $('resumeBtn').addEventListener('click', resume);
   $('quitBtn').addEventListener('click', goMenu);
@@ -847,7 +1118,7 @@
     const r = canvas.getBoundingClientRect();
     const x = (e.clientX - r.left) / r.width * W;
     const y = (e.clientY - r.top) / r.height * H;
-    const idx = settings.mode === 'pvp' ? (x < W / 2 ? 0 : 1) : 0;
+    const idx = settings.mode === 'pvp' ? (x < W / 2 ? 0 : 1) : (isGuest() ? 1 : 0);
     paddles[idx].target = y;
   }
   canvas.addEventListener('pointerdown', (e) => {
@@ -861,6 +1132,10 @@
 
   // キーボード
   window.addEventListener('keydown', (e) => {
+    if (e.target && e.target.tagName === 'INPUT') {  // 部屋コード入力中
+      if (e.code === 'Enter') joinRoom();
+      return;
+    }
     if (['ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) e.preventDefault();
     keys.add(e.code);
     if (e.repeat) return;
@@ -868,7 +1143,8 @@
 
     if (e.code === 'KeyM') { toggleSfx(); return; }
     if (e.code === 'KeyB') { toggleBgm(); return; }
-    if ((state === 'menu' || state === 'over') && e.code === 'Enter' && !onButton) { startGame(); return; }
+    if (!overlays.how.hidden) { if (e.code === 'Escape' || e.code === 'Enter') showOverlay('menu'); return; }
+    if ((state === 'menu' || state === 'over') && e.code === 'Enter' && !onButton && !isOnline()) { startGame(); return; }
     if (state === 'over' && e.code === 'Escape') { goMenu(); return; }
     if (inPlay() && ['Space', 'KeyP', 'Escape'].includes(e.code)) { pause(); return; }
     if (state === 'paused' && ['Space', 'KeyP', 'Enter'].includes(e.code)) { resume(); return; }
